@@ -8,7 +8,13 @@ cloud file events into precise pipeline triggers.
 Onboard a new source that fits an existing pattern by inserting **one row** into a config table — no
 pipeline code change, no redeploy.
 
-> Example/reference code, provided as-is. Sanitize and review before any production use.
+> ## ⚠️ Disclaimer
+>
+> This project is provided **for demonstration and educational purposes only**. It is **not an
+> officially supported Databricks product or solution**, carries **no warranty or support** (express
+> or implied), and is licensed **as-is** under Apache-2.0. It is not covered by any Databricks Service
+> Level Agreement or support agreement. Review, harden, security-test, and adapt it to your own
+> standards before any production use. You are solely responsible for any deployment and its costs.
 
 This reference implementation ingests **two sources of two different formats from two domains**:
 
