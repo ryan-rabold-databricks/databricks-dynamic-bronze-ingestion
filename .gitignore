@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Databricks Asset Bundles
+.databricks/
+bundle.tf.json
+
+# Local / OS
+.DS_Store
+*.log
+/tmp/
+
+# Never commit credentials or local overrides
+*.env
+.databrickscfg
+**/secrets.json

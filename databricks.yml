@@ -1,0 +1,161 @@
+bundle:
+  name: banner-dynamic-bronze
+
+variables:
+  catalog:
+    description: Bronze + control catalog
+    default: banner_bronze
+  control_schema:
+    description: Schema holding source_config and the metadata volume
+    default: control
+  config_table:
+    description: Fully-qualified control config table
+    default: banner_bronze.control.source_config
+  metadata_volume_root:
+    description: UC volume root for Auto Loader schema/checkpoint metadata
+    default: /Volumes/banner_bronze/control/pipeline_metadata
+  aws_region:
+    default: us-west-2
+  account_id:
+    description: AWS account id used in landing bucket names
+    default: "000000000000"
+  crm_landing_url:
+    description: External-location URL watched by the CRM file-arrival trigger
+    default: s3://banner-landing-crm-000000000000/
+  erp_landing_url:
+    description: External-location URL watched by the ERP file-arrival trigger
+    default: s3://banner-landing-erp-000000000000/
+  queue_url:
+    description: SQS queue URL that receives S3 landing events (output of aws/setup_aws.sh)
+    default: ""
+  secret_scope:
+    description: Databricks secret scope holding the orchestrator's AWS keys
+    default: banner_bronze
+  notification_email:
+    default: you@example.com
+
+resources:
+  pipelines:
+    bronze_pg_crm:
+      name: bronze_ingest_pg_crm
+      catalog: ${var.catalog}
+      schema: crm
+      serverless: true
+      continuous: false
+      photon: true
+      configuration:
+        pipeline_group: pg_crm
+        config_table: ${var.config_table}
+        schema_location_base: ${var.metadata_volume_root}/pg_crm
+      libraries:
+        - file:
+            path: ./src/pipeline/dynamic_bronze_pipeline.py
+
+    bronze_pg_erp:
+      name: bronze_ingest_pg_erp
+      catalog: ${var.catalog}
+      schema: erp
+      serverless: true
+      continuous: false
+      photon: true
+      configuration:
+        pipeline_group: pg_erp
+        config_table: ${var.config_table}
+        schema_location_base: ${var.metadata_volume_root}/pg_erp
+      libraries:
+        - file:
+            path: ./src/pipeline/dynamic_bronze_pipeline.py
+
+  jobs:
+    bronze_orchestrator:
+      name: bronze_ingestion_orchestrator
+      description: Drains SQS S3-events, routes keys to pipeline groups, triggers SDP pipelines.
+      # Serialize: if both wakers fire together, the 2nd run finds an empty queue (idempotent no-op).
+      max_concurrent_runs: 1
+      tasks:
+        - task_key: route_and_trigger
+          spark_python_task:
+            python_file: ./src/orchestrator/orchestrate.py
+            parameters:
+              - "--queue-url"
+              - ${var.queue_url}
+              - "--config-table"
+              - ${var.config_table}
+              - "--pipeline-map"
+              - '{"pg_crm": "${resources.pipelines.bronze_pg_crm.id}", "pg_erp": "${resources.pipelines.bronze_pg_erp.id}"}'
+              - "--region"
+              - ${var.aws_region}
+              - "--secret-scope"
+              - ${var.secret_scope}
+          environment_key: orchestrator_env
+      environments:
+        - environment_key: orchestrator_env
+          spec:
+            client: "3"
+            dependencies:
+              - boto3
+      # No schedule here: the orchestrator is woken event-driven by the file-arrival waker jobs
+      # below (one per landing external location). It can still be run on demand.
+      email_notifications:
+        on_failure:
+          - ${var.notification_email}
+
+    # File-arrival wakers: one per landing external location. Each fires when new files land in its
+    # bucket and simply run_job_task -> the orchestrator (single source of truth for drain/route).
+    # This is the event-driven alternative to the cron schedule. Bucket-per-domain means one waker
+    # per domain; a job's file_arrival trigger watches exactly one URL.
+    bronze_waker_crm:
+      name: bronze_waker_crm
+      max_concurrent_runs: 1
+      tasks:
+        - task_key: wake_orchestrator
+          run_job_task:
+            job_id: ${resources.jobs.bronze_orchestrator.id}
+      trigger:
+        pause_status: UNPAUSED
+        file_arrival:
+          url: ${var.crm_landing_url}
+          min_time_between_triggers_seconds: 60
+
+    bronze_waker_erp:
+      name: bronze_waker_erp
+      max_concurrent_runs: 1
+      tasks:
+        - task_key: wake_orchestrator
+          run_job_task:
+            job_id: ${resources.jobs.bronze_orchestrator.id}
+      trigger:
+        pause_status: UNPAUSED
+        file_arrival:
+          url: ${var.erp_landing_url}
+          min_time_between_triggers_seconds: 60
+
+    # Convenience job to (re)seed the control config table.
+    seed_source_config:
+      name: bronze_seed_source_config
+      tasks:
+        - task_key: seed
+          spark_python_task:
+            python_file: ./src/setup/02_seed_source_config.py
+            parameters:
+              - "--config-table"
+              - ${var.config_table}
+              - "--account-id"
+              - "000000000000"
+          environment_key: seed_env
+      environments:
+        - environment_key: seed_env
+          spec:
+            client: "3"
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://YOUR-WORKSPACE.cloud.databricks.com
+
+  prod:
+    mode: production
+    workspace:
+      host: https://YOUR-WORKSPACE.cloud.databricks.com
