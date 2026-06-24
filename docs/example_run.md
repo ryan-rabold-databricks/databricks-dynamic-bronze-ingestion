@@ -46,3 +46,20 @@ A second CSV batch lands in the CRM bucket only.
 
 This demonstrates the two properties that matter most for intermittent, multi-source landing zones:
 checkpoints survive across runs, and only the pipelines with new data are woken.
+
+## Run 3 — event-driven via the file-arrival waker
+
+Two more ERP batches land (40 + 30 rows). The ERP **waker** job runs and `run_job_task`s the
+orchestrator:
+
+- Orchestrator run shows `trigger = RUN_JOB_TASK`, SUCCESS — i.e. the waker -> orchestrator chain
+  is what drove ingestion (no manual orchestrator call).
+- `pg_erp` ingests incrementally: `orders_raw` **100 -> 170** (the two new batches; the original 100
+  were not reprocessed — checkpoint retained).
+- `pg_crm` is untouched.
+
+> Note on file-arrival latency: a Databricks `file_arrival` trigger establishes a baseline on its
+> first evaluation and fires on files that arrive *after* that. In a quick test loop, files landing
+> seconds after deploy can be captured in the baseline and not trigger; allow a few minutes and land
+> a fresh file to see auto-detection. The waker -> `run_job_task` -> orchestrator -> pipeline wiring
+> itself is deterministic and verified above.
