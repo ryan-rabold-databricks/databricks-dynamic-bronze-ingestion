@@ -105,21 +105,32 @@ put_notification "$CRM_BUCKET"
 put_notification "$ERP_BUCKET"
 
 echo "-- orchestrator IAM role (assumable by Unity Catalog) + least-privilege SQS policy"
-# Self-assuming trust: UC master role AND the role's own ARN, gated by the metastore external id.
-TRUST_POLICY=$(cat <<JSON
-{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
-  "Principal":{"AWS":["$UC_MASTER_ROLE_ARN","$ORCH_ROLE_ARN"]},
-  "Action":["sts:AssumeRole","sts:TagSession"],
-  "Condition":{"StringEquals":{"sts:ExternalId":"$UC_EXTERNAL_ID"}}}]}
-JSON
-)
-if awscli iam get-role --role-name "$ORCH_ROLE" >/dev/null 2>&1; then
-  awscli iam update-assume-role-policy --role-name "$ORCH_ROLE" --policy-document "$TRUST_POLICY"
-  echo "  updated trust on $ORCH_ROLE"
-else
-  awscli iam create-role --role-name "$ORCH_ROLE" --assume-role-policy-document "$TRUST_POLICY" >/dev/null
-  echo "  created role $ORCH_ROLE"
+# UC service-credential roles must be SELF-ASSUMING: the trust lists the UC master role AND the
+# role's own ARN, gated by the metastore external id. AWS rejects a role's own ARN as a principal
+# until the role exists AND has propagated, so we create the role with the UC master role only,
+# then add the self-reference, retrying past IAM's eventual consistency.
+trust_policy() {  # $1 = extra principal ARN ("" for base, self ARN for self-assuming)
+  local principals="\"$UC_MASTER_ROLE_ARN\""
+  [ -n "$1" ] && principals="$principals,\"$1\""
+  printf '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":[%s]},"Action":["sts:AssumeRole","sts:TagSession"],"Condition":{"StringEquals":{"sts:ExternalId":"%s"}}}]}' "$principals" "$UC_EXTERNAL_ID"
+}
+if ! awscli iam get-role --role-name "$ORCH_ROLE" >/dev/null 2>&1; then
+  awscli iam create-role --role-name "$ORCH_ROLE" \
+    --assume-role-policy-document "$(trust_policy "")" >/dev/null
+  echo "  created role $ORCH_ROLE (base trust)"
 fi
+# Add the self-assuming principal; a freshly-created role's ARN is not immediately a valid
+# principal, so retry until IAM has propagated it.
+for attempt in $(seq 1 12); do
+  if awscli iam update-assume-role-policy --role-name "$ORCH_ROLE" \
+       --policy-document "$(trust_policy "$ORCH_ROLE_ARN")" 2>/dev/null; then
+    echo "  self-assuming trust set on $ORCH_ROLE"
+    break
+  fi
+  [ "$attempt" -eq 12 ] && { echo "  ERROR: could not set self-assuming trust after retries"; exit 1; }
+  echo "  waiting for role propagation (attempt $attempt)..."
+  sleep 10
+done
 ORCH_POLICY=$(cat <<JSON
 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["sqs:ReceiveMessage","sqs:DeleteMessage","sqs:DeleteMessageBatch","sqs:GetQueueAttributes"],"Resource":"$QUEUE_ARN"}]}
 JSON
