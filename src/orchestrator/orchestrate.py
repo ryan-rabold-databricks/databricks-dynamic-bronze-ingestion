@@ -22,15 +22,16 @@ Idempotency / safety:
 
 Auth:
   - Databricks: uses the job's run-as identity (default WorkspaceClient()).
-  - AWS SQS: credentials read from a Databricks secret scope (works on serverless and classic).
+  - AWS SQS: a Unity Catalog SERVICE credential vends short-lived, auto-refreshed STS
+    credentials (no static keys). Requires serverless environment version 3+ (which the
+    orchestrator job uses). The job's run-as identity must have ACCESS on the credential.
 
 Args:
   --queue-url, --config-table, --pipeline-map (JSON {group: pipeline_id}),
-  --region, --secret-scope, [--max-messages], [--wait-seconds], [--visibility-timeout]
+  --region, --service-credential, [--max-messages], [--wait-seconds], [--visibility-timeout]
 """
 
 import argparse
-import base64
 import json
 import sys
 from urllib.parse import unquote_plus
@@ -42,19 +43,13 @@ def parse_args(argv):
     p.add_argument("--config-table", required=True)
     p.add_argument("--pipeline-map", required=True, help='JSON {"pg_crm":"<id>","pg_erp":"<id>"}')
     p.add_argument("--region", required=True)
-    p.add_argument("--secret-scope", required=True)
-    p.add_argument("--aws-access-key-id-key", default="aws_access_key_id")
-    p.add_argument("--aws-secret-access-key-key", default="aws_secret_access_key")
+    p.add_argument("--service-credential", required=True,
+                   help="UC SERVICE credential name that grants the orchestrator SQS access")
     p.add_argument("--max-messages", type=int, default=2000)
     p.add_argument("--wait-seconds", type=int, default=10)
     p.add_argument("--visibility-timeout", type=int, default=120)
     p.add_argument("--empty-polls-before-exit", type=int, default=2)
     return p.parse_args(argv)
-
-
-def get_secret(w, scope, key):
-    raw = w.secrets.get_secret(scope=scope, key=key).value
-    return base64.b64decode(raw).decode("utf-8")
 
 
 def load_routes(config_table):
@@ -187,16 +182,18 @@ def main(argv=None):
 
     from databricks.sdk import WorkspaceClient
 
-    w = WorkspaceClient()
+    w = WorkspaceClient()  # still used to trigger pipeline updates (run-as identity)
 
     import boto3
 
-    sqs = boto3.client(
-        "sqs",
+    # UC service credential -> short-lived, auto-refreshed STS creds. No static keys.
+    # dbutils is not a global in a spark_python_task, so import it from the runtime.
+    from databricks.sdk.runtime import dbutils
+
+    sqs = boto3.Session(
+        botocore_session=dbutils.credentials.getServiceCredentialsProvider(args.service_credential),
         region_name=args.region,
-        aws_access_key_id=get_secret(w, args.secret_scope, args.aws_access_key_id_key),
-        aws_secret_access_key=get_secret(w, args.secret_scope, args.aws_secret_access_key_key),
-    )
+    ).client("sqs")
 
     routes = load_routes(args.config_table)
     print(f"[init ] loaded {len(routes)} active route(s): "

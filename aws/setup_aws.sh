@@ -5,23 +5,36 @@
 #   - 1 SNS topic that both buckets publish ObjectCreated events to
 #   - 1 SQS queue subscribed to the topic (raw message delivery)
 #   - bucket notifications -> SNS
-#   - 1 IAM user for the orchestrator with least-privilege SQS access (prints access keys)
+#   - 1 IAM role for the orchestrator, assumable by Unity Catalog for a SERVICE credential
+#     (short-lived STS creds, no static access keys)
 #
 # Idempotent: safe to re-run. All names are derived from ACCOUNT_ID so they are globally unique.
 #
 # Usage:
-#   AWS_PROFILE=aws-sandbox-field-eng_databricks-sandbox-admin ./setup_aws.sh
+#   AWS_PROFILE=aws-sandbox-field-eng_databricks-sandbox-admin \
+#   UC_MASTER_ROLE_ARN=arn:aws:iam::414351767826:role/unity-catalog-prod-UCMasterRole-XXXX \
+#   UC_EXTERNAL_ID=<metastore-external-id> \
+#     ./setup_aws.sh
+#
+# Get UC_MASTER_ROLE_ARN + UC_EXTERNAL_ID from any existing UC credential in the metastore:
+#   databricks credentials list-credentials -o json
+#   (fields: aws_iam_role.unity_catalog_iam_arn and aws_iam_role.external_id)
 set -euo pipefail
 
 PROFILE="${AWS_PROFILE:-aws-sandbox-field-eng_databricks-sandbox-admin}"
-REGION="${AWS_REGION:-us-east-2}"
+REGION="${AWS_REGION:-us-west-2}"
 ACCOUNT_ID="${ACCOUNT_ID:-$(aws sts get-caller-identity --profile "$PROFILE" --query Account --output text)}"
+
+# Unity Catalog trust inputs (required for the service-credential role trust policy).
+UC_MASTER_ROLE_ARN="${UC_MASTER_ROLE_ARN:?set UC_MASTER_ROLE_ARN (aws_iam_role.unity_catalog_iam_arn from an existing UC credential)}"
+UC_EXTERNAL_ID="${UC_EXTERNAL_ID:?set UC_EXTERNAL_ID (aws_iam_role.external_id / metastore external id)}"
 
 CRM_BUCKET="banner-landing-crm-${ACCOUNT_ID}"
 ERP_BUCKET="banner-landing-erp-${ACCOUNT_ID}"
 TOPIC_NAME="banner-bronze-landing-events"
 QUEUE_NAME="banner-bronze-landing-queue"
-IAM_USER="banner-bronze-orchestrator"
+ORCH_ROLE="banner-bronze-orchestrator-svccred"
+ORCH_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ORCH_ROLE}"
 
 awscli() { aws --profile "$PROFILE" --region "$REGION" "$@"; }
 
@@ -91,24 +104,52 @@ echo "-- bucket notifications"
 put_notification "$CRM_BUCKET"
 put_notification "$ERP_BUCKET"
 
-echo "-- orchestrator IAM user + least-privilege SQS policy"
-awscli iam get-user --user-name "$IAM_USER" >/dev/null 2>&1 || awscli iam create-user --user-name "$IAM_USER" >/dev/null
+echo "-- orchestrator IAM role (assumable by Unity Catalog) + least-privilege SQS policy"
+# UC service-credential roles must be SELF-ASSUMING: the trust lists the UC master role AND the
+# role's own ARN, gated by the metastore external id. AWS rejects a role's own ARN as a principal
+# until the role exists AND has propagated, so we create the role with the UC master role only,
+# then add the self-reference, retrying past IAM's eventual consistency.
+trust_policy() {  # $1 = extra principal ARN ("" for base, self ARN for self-assuming)
+  local principals="\"$UC_MASTER_ROLE_ARN\""
+  [ -n "$1" ] && principals="$principals,\"$1\""
+  printf '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":[%s]},"Action":["sts:AssumeRole","sts:TagSession"],"Condition":{"StringEquals":{"sts:ExternalId":"%s"}}}]}' "$principals" "$UC_EXTERNAL_ID"
+}
+if ! awscli iam get-role --role-name "$ORCH_ROLE" >/dev/null 2>&1; then
+  awscli iam create-role --role-name "$ORCH_ROLE" \
+    --assume-role-policy-document "$(trust_policy "")" >/dev/null
+  echo "  created role $ORCH_ROLE (base trust)"
+fi
+# Add the self-assuming principal; a freshly-created role's ARN is not immediately a valid
+# principal, so retry until IAM has propagated it.
+for attempt in $(seq 1 12); do
+  if awscli iam update-assume-role-policy --role-name "$ORCH_ROLE" \
+       --policy-document "$(trust_policy "$ORCH_ROLE_ARN")" 2>/dev/null; then
+    echo "  self-assuming trust set on $ORCH_ROLE"
+    break
+  fi
+  [ "$attempt" -eq 12 ] && { echo "  ERROR: could not set self-assuming trust after retries"; exit 1; }
+  echo "  waiting for role propagation (attempt $attempt)..."
+  sleep 10
+done
 ORCH_POLICY=$(cat <<JSON
 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["sqs:ReceiveMessage","sqs:DeleteMessage","sqs:DeleteMessageBatch","sqs:GetQueueAttributes"],"Resource":"$QUEUE_ARN"}]}
 JSON
 )
-awscli iam put-user-policy --user-name "$IAM_USER" --policy-name sqs-read-delete \
+awscli iam put-role-policy --role-name "$ORCH_ROLE" --policy-name sqs-read-delete \
   --policy-document "$ORCH_POLICY"
 
 echo
 echo "============================================================"
-echo "DONE. Save these for the bundle + secret scope:"
-echo "  AWS_REGION   = $REGION"
-echo "  QUEUE_URL    = $QUEUE_URL"
-echo "  CRM_BUCKET   = $CRM_BUCKET"
-echo "  ERP_BUCKET   = $ERP_BUCKET"
-echo "  SNS_TOPIC    = $TOPIC_ARN"
+echo "DONE. Save these for the bundle:"
+echo "  AWS_REGION     = $REGION"
+echo "  QUEUE_URL      = $QUEUE_URL"
+echo "  CRM_BUCKET     = $CRM_BUCKET"
+echo "  ERP_BUCKET     = $ERP_BUCKET"
+echo "  SNS_TOPIC      = $TOPIC_ARN"
+echo "  ORCH_ROLE_ARN  = $ORCH_ROLE_ARN"
 echo
-echo "Create orchestrator access keys (run once, store in the Databricks secret scope):"
-echo "  aws --profile $PROFILE iam create-access-key --user-name $IAM_USER"
+echo "Create the UC SERVICE credential (name must match var.service_credential in databricks.yml)"
+echo "and grant the orchestrator's run-as identity ACCESS on it:"
+echo "  databricks credentials create-credential --json '{\"name\":\"banner_bronze_orchestrator\",\"purpose\":\"SERVICE\",\"aws_iam_role\":{\"role_arn\":\"$ORCH_ROLE_ARN\"}}'"
+echo "  databricks grants update credential banner_bronze_orchestrator --json '{\"changes\":[{\"principal\":\"<orchestrator-run-as>\",\"add\":[\"ACCESS\"]}]}'"
 echo "============================================================"
