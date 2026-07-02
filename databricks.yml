@@ -28,9 +28,9 @@ variables:
   queue_url:
     description: SQS queue URL that receives S3 landing events (output of aws/setup_aws.sh)
     default: ""
-  secret_scope:
-    description: Databricks secret scope holding the orchestrator's AWS keys
-    default: banner_bronze
+  service_credential:
+    description: UC SERVICE credential name granting the orchestrator SQS access (no static keys)
+    default: banner_bronze_orchestrator
   notification_email:
     default: you@example.com
 
@@ -85,8 +85,8 @@ resources:
               - '{"pg_crm": "${resources.pipelines.bronze_pg_crm.id}", "pg_erp": "${resources.pipelines.bronze_pg_erp.id}"}'
               - "--region"
               - ${var.aws_region}
-              - "--secret-scope"
-              - ${var.secret_scope}
+              - "--service-credential"
+              - ${var.service_credential}
           environment_key: orchestrator_env
       environments:
         - environment_key: orchestrator_env

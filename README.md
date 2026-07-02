@@ -58,7 +58,7 @@ sources, replays, and at-least-once event delivery are all handled for free. See
 | `src/control/assign_pipeline_group.py` | Stable (sha256) source → pipeline_group assignment with per-domain sharding |
 | `src/setup/01_create_uc_assets.sql` | Catalog, schemas, metadata volume, control config table |
 | `src/setup/02_seed_source_config.py` | Seeds sources into `source_config` (groups via stable hash) |
-| `aws/setup_aws.sh` | Creates landing buckets, SNS, SQS, notifications, orchestrator IAM user |
+| `aws/setup_aws.sh` | Creates landing buckets, SNS, SQS, notifications, and the orchestrator IAM role for a UC service credential |
 | `aws/setup_uc_storage.py` | Creates UC storage credential + external locations (the IAM-trust handshake) |
 | `aws/teardown_aws.sh` | Tears down the AWS resources |
 | `data/generate_and_land.py` | Generates CSV + Parquet sample files and lands them (fires events) |
@@ -84,10 +84,13 @@ Two options, both included:
 Set your values first: edit `databricks.yml` (`var.account_id`, the landing URLs, workspace host in
 `targets`). Then:
 
-1. `aws/setup_aws.sh` — provision S3/SNS/SQS/IAM (note the queue URL + orchestrator access keys).
+1. `aws/setup_aws.sh` — provision S3/SNS/SQS + the orchestrator IAM role (note the queue URL and
+   the printed `ORCH_ROLE_ARN`). Pass `UC_MASTER_ROLE_ARN` and `UC_EXTERNAL_ID` (see the script header).
 2. `aws/setup_uc_storage.py` — create the UC storage credential + external locations.
-3. Create a Databricks secret scope with the orchestrator's AWS keys
-   (`aws_access_key_id`, `aws_secret_access_key`).
+3. Create the UC **SERVICE credential** for the orchestrator (name must match `var.service_credential`,
+   default `banner_bronze_orchestrator`) and grant the orchestrator job's run-as identity `ACCESS` on it.
+   The exact `databricks credentials create-credential` + `databricks grants update` commands are
+   printed by `setup_aws.sh`. No static AWS keys or secret scope are needed.
 4. Create UC assets + config table (`src/setup/01_create_uc_assets.sql`).
 5. `databricks bundle deploy` — deploy pipelines, orchestrator, and wakers.
 6. Seed config (`src/setup/02_seed_source_config.py` or the `seed_source_config` job).

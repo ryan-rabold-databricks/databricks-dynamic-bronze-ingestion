@@ -4,14 +4,14 @@
 set -uo pipefail
 
 PROFILE="${AWS_PROFILE:-aws-sandbox-field-eng_databricks-sandbox-admin}"
-REGION="${AWS_REGION:-us-east-2}"
+REGION="${AWS_REGION:-us-west-2}"
 ACCOUNT_ID="${ACCOUNT_ID:-$(aws sts get-caller-identity --profile "$PROFILE" --query Account --output text)}"
 
 CRM_BUCKET="banner-landing-crm-${ACCOUNT_ID}"
 ERP_BUCKET="banner-landing-erp-${ACCOUNT_ID}"
 QUEUE_NAME="banner-bronze-landing-queue"
 TOPIC_NAME="banner-bronze-landing-events"
-IAM_USER="banner-bronze-orchestrator"
+ORCH_ROLE="banner-bronze-orchestrator-svccred"
 
 awscli() { aws --profile "$PROFILE" --region "$REGION" "$@"; }
 
@@ -27,11 +27,9 @@ QUEUE_URL=$(awscli sqs get-queue-url --queue-name "$QUEUE_NAME" --query QueueUrl
 TOPIC_ARN=$(awscli sns list-topics --query "Topics[?contains(TopicArn, '$TOPIC_NAME')].TopicArn | [0]" --output text 2>/dev/null)
 [ -n "${TOPIC_ARN:-}" ] && [ "$TOPIC_ARN" != "None" ] && awscli sns delete-topic --topic-arn "$TOPIC_ARN" && echo "deleted topic"
 
-for k in $(awscli iam list-access-keys --user-name "$IAM_USER" --query 'AccessKeyMetadata[].AccessKeyId' --output text 2>/dev/null); do
-  awscli iam delete-access-key --user-name "$IAM_USER" --access-key-id "$k"
-done
-awscli iam delete-user-policy --user-name "$IAM_USER" --policy-name sqs-read-delete 2>/dev/null
-awscli iam delete-user --user-name "$IAM_USER" 2>/dev/null && echo "deleted iam user"
+awscli iam delete-role-policy --role-name "$ORCH_ROLE" --policy-name sqs-read-delete 2>/dev/null
+awscli iam delete-role --role-name "$ORCH_ROLE" 2>/dev/null && echo "deleted iam role"
 
-echo "Note: UC storage credential / external locations / catalog are NOT deleted here."
-echo "Remove via Databricks if desired: external locations banner_landing_*, credential banner_bronze_landing."
+echo "Note: UC credentials / external locations / catalog are NOT deleted here."
+echo "Remove via Databricks if desired: external locations banner_landing_*, storage credential"
+echo "banner_bronze_landing, and SERVICE credential banner_bronze_orchestrator."
